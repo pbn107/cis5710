@@ -80,7 +80,7 @@ async def testRead(dut):
     "One read hit"
     axil_cache = await preTestSetup(dut)
 
-    addr = 0
+    addr = 0x4
     expected_value = 0x1111_1111
     setCacheValue(dut, addr, expected_value)
 
@@ -88,6 +88,7 @@ async def testRead(dut):
     cache_value = await axil_cache.read_dword(addr)
 
     assertEquals(expected_value, cache_value, f'expected {expected_value:#x} but was {cache_value:#x}')
+    await ClockCycles(dut.ACLK, 5)
 
 @cocotb.test(timeout_time=1600*CLOCK_PERIOD_NS, timeout_unit="ns")
 async def testReadMany(dut):

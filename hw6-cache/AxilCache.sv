@@ -1,3 +1,4 @@
+
 `timescale 1ns / 1ns
 
 `define ADDR_WIDTH 32
@@ -164,7 +165,9 @@ typedef enum {
   // cache can respond to an incoming request
   CACHE_AVAILABLE = 0,
   // cache miss, waiting for fill from memory
-  CACHE_AWAIT_FILL_RESPONSE = 1,
+  CACHE_AWAIT_READ_FILL_RESPONSE = 1,
+   // cache miss, waiting for fill from memory
+  CACHE_AWAIT_WRITE_FILL_RESPONSE = 4,
   // cache miss, waiting for writeback to memory
   CACHE_AWAIT_WRITEBACK_RESPONSE = 2,
   // cache waiting for manager to accept response
@@ -184,12 +187,15 @@ module AxilCache #(
 );
 
   // TODO: calculate these
-  localparam int BlockOffsetBits = 0;
-  localparam int IndexBits = 0;
-  localparam int TagBits = 0;
+  localparam bit True = 1'b1;
+  localparam bit False = 1'b0;
+  localparam int BlockOffsetBits = 2;
+  localparam int IndexBits = $clog2(NUM_SETS);;
+  localparam int TagBits = `ADDR_WIDTH - IndexBits - BlockOffsetBits;
 
   // cache state
   cache_state_t current_state;
+
   // main cache structures: do not rename as tests reference these names
   logic [BLOCK_SIZE_BITS-1:0] data[NUM_SETS];
   logic [TagBits-1:0] tag[NUM_SETS];
@@ -222,12 +228,254 @@ module AxilCache #(
 
   // TODO: the rest of your changes will go below
 
+  logic [BLOCK_SIZE_BITS-1:0] bufferAdd;
+  logic [BLOCK_SIZE_BITS-1:0] bufferData;
+  logic [BLOCK_SIZE_BITS-1:0] bufferData_comb;
+  logic [BLOCK_SIZE_BITS-1:0] bufferAdd_comb;
+  logic [BLOCK_SIZE_BITS-1:0] rdata;
+  logic readBuffered_comb;
+  logic handshake_pending_comb;
+  logic readBuffered;
+  logic handshake_pending;
+  logic [BLOCK_SIZE_BITS-1:0] data_comb;
+  logic buffer;
+  logic PrevExactRead;
+  logic writeMiss;
+  logic readMiss;
+  logic isWrite;
+  logic isRead;
+  logic arready;
+  logic arvalid;
+  logic [BLOCK_SIZE_BITS-1:0] araddr;
+  logic rready;
+  logic awready;
+  logic wready;
+  logic readHandshake;
+  logic rvalid;
+  logic write_to_cache;
+  cache_state_t next_state;
   always_ff @(posedge ACLK) begin
-    if (!ARESETn) begin // NB: reset when ARESETn == 0
-      current_state <= CACHE_AVAILABLE;
-    end
+      if (!ARESETn) begin // NB: reset when ARESETn == 0
+          current_state <= CACHE_AVAILABLE;
+          proc.ARREADY <= True;
+          proc.AWREADY <= True;
+          proc.BVALID <= False;
+      end else begin
+              current_state <= next_state;
+            
+              proc.ARREADY <= proc.RREADY || !readBuffered_comb? True: arready;
+              proc.AWREADY <= awready;
+              proc.WREADY <= wready;
+
+              mem.RREADY <= rready;
+              mem.ARADDR <= araddr;
+              mem.ARVALID <= arvalid;
+
+              readBuffered <= readBuffered_comb;
+              handshake_pending <= handshake_pending_comb;
+              bufferAdd <= bufferAdd_comb;
+              bufferData <= bufferData_comb;
+
+               if (isRead || readHandshake || handshake_pending) begin
+                    proc.RVALID <= rvalid;
+                    if (isRead || readHandshake) begin
+                    rdata <= data_comb;
+                    end
+               end
+
+              if (isWrite) begin
+                if (proc.WSTRB[0]) begin
+                  data[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]][7:0] <= data_comb[7:0];
+                end
+                if (proc.WSTRB[1]) begin
+                  data[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]][15:8] <= data_comb[15:8];
+                end
+                if (proc.WSTRB[2]) begin
+                  data[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]][23:16] <= data_comb[23:16];
+                end
+                if (proc.WSTRB[3]) begin
+                  data[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]][31:24] <= data_comb[31:24];
+                end
+                dirty[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <= True;
+                tag[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <=
+                  proc.AWADDR[`ADDR_WIDTH-1:IndexBits + BlockOffsetBits];
+                valid[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <= True;
+                proc.BVALID <= True;
+              end 
+              
+              if (proc.BVALID && proc.BREADY) begin
+                  proc.BVALID <= False;
+              end
+
+              if (write_to_cache) begin
+                 if (mem.RVALID && mem.RREADY) begin
+                // fill cache with data from memory
+                data[mem.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <= mem.RDATA;
+                tag[mem.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <= mem.ARADDR[`ADDR_WIDTH-1:IndexBits + BlockOffsetBits];
+                valid[mem.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <= True;
+                end
+            end
+      end      
   end
 
+  always_comb begin
+    if (!ARESETn) begin
+      rvalid = False;
+      PrevExactRead = False;
+      bufferAdd_comb = 0;
+      writeMiss = False;
+      isWrite = False;
+      isRead = False;
+      readHandshake = False;
+      arready = True;
+      awready = True;
+      wready = True;
+      data_comb = 0;
+      handshake_pending_comb = False;
+      readBuffered_comb = False;
+      write_to_cache = False;
+    end else begin
+      // default values
+      write_to_cache = False;
+      handshake_pending_comb = handshake_pending;
+      readBuffered_comb = readBuffered;
+      bufferData_comb = bufferData;
+      bufferAdd_comb = bufferAdd;
+      rvalid = handshake_pending? True: False;
+      arready = (!handshake_pending);
+      awready = True;
+      wready = True;
+      data_comb = 0;
+      buffer = False;
+      PrevExactRead = False;
+      writeMiss = False;
+      readMiss = False;
+      isWrite = False;
+      isRead = False;
+      readHandshake = False;
+      // state machine
+      mem.AWPROT = 3'b000;
+      case (current_state)
+          CACHE_AVAILABLE: begin
+            proc.RDATA = rdata;
+            if (proc.ARVALID && proc.ARREADY) begin
+                  if (valid[proc.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] &&
+                    tag[proc.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] ==
+                    proc.ARADDR[`ADDR_WIDTH-1:IndexBits + BlockOffsetBits]) begin
+
+                    // cache hit
+                    if (!handshake_pending) begin
+                      rvalid = True;
+                      data_comb  = data[proc.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]];
+                      isRead = True;
+                      handshake_pending_comb = True;
+                    end else begin 
+                      //rvalid = True;
+                      handshake_pending_comb = True;
+                      readBuffered_comb = True;
+                      arready = False;
+                      bufferAdd_comb = proc.ARADDR;
+                    end
+                  next_state = CACHE_AVAILABLE;
+            end else begin
+                      next_state = CACHE_AWAIT_READ_FILL_RESPONSE;
+                      rvalid = False;
+                      data_comb = 0;
+                      arvalid = True;
+                      araddr = proc.ARADDR;
+                      rready = True;
+                      readMiss = True;
+                    end
+            end
+            if (proc.RVALID && proc.RREADY) begin
+                  readHandshake = True;
+                  if (readBuffered_comb) begin 
+                      data_comb = data[bufferAdd_comb[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]];
+                      bufferData_comb = data_comb;
+                      rvalid = True;
+                      arready = True;
+                      bufferAdd_comb = 0;
+                      handshake_pending_comb = True;
+                      readBuffered_comb = False;
+                  end else begin
+                      data_comb = data[proc.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]];
+                      rvalid = False;
+                      arready = True;
+                      handshake_pending_comb = False;
+                  end
+                  next_state = CACHE_AVAILABLE;
+            end
+          
+            if (proc.AWREADY && proc.AWVALID && proc.WVALID && proc.WREADY) begin
+                if (valid[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] &&
+                  tag[proc.AWADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] ==
+                  proc.AWADDR[`ADDR_WIDTH-1:IndexBits + BlockOffsetBits]) begin
+                    // cache hit
+                    writeMiss = False;
+                    arready = True;
+                    isWrite = True;
+                    wready = True;
+                    //mem.AWPROT = 3'b001;
+                    if (proc.WSTRB[0]) begin
+                      data_comb[7:0] = proc.WDATA[7:0];
+                    end 
+                    if (proc.WSTRB[1]) begin
+                      data_comb[15:8] = proc.WDATA[15:8];
+                    end
+                    if (proc.WSTRB[2]) begin
+                      data_comb[23:16] = proc.WDATA[23:16];
+                    end
+                    if (proc.WSTRB[3]) begin
+                      data_comb[31:24] = proc.WDATA[31:24];
+                    end
+                    next_state = CACHE_AVAILABLE;
+                  end else begin
+
+                    next_state = CACHE_AWAIT_WRITE_FILL_RESPONSE;
+                    rvalid = False;
+                    data_comb = 0;
+                    arready = False;
+                    arvalid = True;
+                    araddr = proc.AWADDR;
+                    rready = True;
+                    writeMiss = True;
+                  end
+                
+            end
+          end
+          CACHE_AWAIT_READ_FILL_RESPONSE:  begin
+         
+              if (mem.RVALID && mem.RREADY) begin
+                // fill cache with data from memory
+                // data[mem.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <= mem.RDATA;
+                // tag[mem.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <= mem.ARADDR[`ADDR_WIDTH-1:IndexBits + BlockOffsetBits];
+                // valid[mem.ARADDR[IndexBits + BlockOffsetBits - 1:BlockOffsetBits]] <= True;
+                // check dirty it here
+                // memoory signal not being set low
+                rready = False;
+                arvalid = False;
+                rvalid = True;
+                proc.RDATA = rdata;
+                data_comb =  mem.RDATA;
+                next_state = CACHE_AVAILABLE;
+                isRead = True;
+                write_to_cache = True;
+              end
+            end
+
+          CACHE_AWAIT_WRITE_FILL_RESPONSE: begin
+                rvalid = False;
+                arready = False;
+                data_comb = 0;
+                rready = True;
+                arvalid = True;
+                araddr = proc.AWADDR;
+                next_state = CACHE_AVAILABLE;
+                write_to_cache = True;
+          end
+      endcase
+    end
+  end
 endmodule // AxilCache
 
 `ifndef SYNTHESIS
@@ -344,3 +592,4 @@ module AxilCacheTester #(
   );
 endmodule // AxilCacheTester
 `endif
+
